@@ -2318,7 +2318,21 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 
 	int done = 0;
 
-	assert(offset == 0);
+	/*
+	 * sshfs uses old-style readdir (filler always called with offset=0),
+	 * so FUSE should return all entries in one call (offset=0).
+	 * On macOS with macFUSE 5.3.x / FSKit backend, Finder or Spotlight
+	 * may call readdir again with a non-zero offset even in old-style mode.
+	 * When that happens, all entries were already returned in the first
+	 * call, so we can safely return 0 (no more entries) instead of crashing.
+	 * See: https://github.com/libfuse/sshfs/issues/338
+	 */
+#ifndef __APPLE__
+ assert(offset == 0);
+#endif
+	if (offset != 0)
+		return 0;
+
 	while (!done || outstanding) {
 		struct request *req;
 		struct buffer name;
@@ -2390,7 +2404,13 @@ static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
 			     void *buf, off_t offset, fuse_fill_dir_t filler)
 {
 	int err;
+	/* See comment in sftp_readdir_async for why offset != 0 is handled
+	 * this way instead of asserting. */
+#ifndef __APPLE__
 	assert(offset == 0);
+#endif	
+ if (offset != 0)
+		return 0;
 	do {
 		struct buffer name;
 		err = sftp_request(conn, SSH_FXP_READDIR, handle, SSH_FXP_NAME, &name);

@@ -386,7 +386,13 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	struct node *node;
 	struct cache_dirent **cdent;
 
-	assert(offset == 0);
+#ifndef __APPLE__
+	assert(offset == 0);  /* keep for non-macOS; see sshfs.c sftp_readdir_async */
+#endif	
+	/* On macOS with macFUSE 5.3.x / FSKit, may be called with offset != 0.
+	 * All entries were already returned in the first (offset=0) call. */
+	if (offset != 0)
+		return 0;
 
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
