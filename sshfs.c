@@ -228,9 +228,25 @@ struct buffer {
 	size_t size;
 };
 
+struct dir_entry {
+	char *name;
+	struct stat stbuf;
+};
+
 struct dir_handle {
 	struct buffer buf;
 	struct conn *conn;
+	/*
+	 * Cached snapshot of the whole directory listing. sshfs uses
+	 * old-style readdir and the underlying SFTP directory handle is
+	 * single-pass, so we read the entire directory once and serve every
+	 * readdir call (with any offset, including offset==0 rewinds issued
+	 * by macFUSE) from this snapshot. See:
+	 * https://github.com/libfuse/sshfs/issues/338
+	 */
+	GPtrArray *entries;	/* array of struct dir_entry * */
+	int read_done;		/* directory has been read from the server */
+	int read_err;		/* error from reading the directory, if any */
 };
 
 struct list_head {
@@ -958,8 +974,7 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
-static int buf_get_entries(struct buffer *buf, void *dbuf,
-                           fuse_fill_dir_t filler)
+static int buf_get_entries(struct buffer *buf, GPtrArray *entries)
 {
 	uint32_t count;
 	unsigned i;
@@ -978,11 +993,16 @@ static int buf_get_entries(struct buffer *buf, void *dbuf,
 			free(longname);
 			err = buf_get_attrs(buf, &stbuf, NULL);
 			if (!err) {
+				struct dir_entry *entry;
 				if (sshfs.follow_symlinks &&
 				    S_ISLNK(stbuf.st_mode)) {
 					stbuf.st_mode = 0;
 				}
-				filler(dbuf, name, &stbuf, 0, 0);
+				entry = g_new(struct dir_entry, 1);
+				entry->name = name;
+				entry->stbuf = stbuf;
+				g_ptr_array_add(entries, entry);
+				name = NULL; /* ownership passed to entry */
 			}
 		}
 		free(name);
@@ -2309,7 +2329,7 @@ static int sshfs_req_pending(struct request *req)
 }
 
 static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
-			      void *buf, off_t offset, fuse_fill_dir_t filler)
+			      GPtrArray *entries)
 {
 	int err = 0;
 	int outstanding = 0;
@@ -2317,21 +2337,6 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 	GList *list = NULL;
 
 	int done = 0;
-
-	/*
-	 * sshfs uses old-style readdir (filler always called with offset=0),
-	 * so FUSE should return all entries in one call (offset=0).
-	 * On macOS with macFUSE 5.3.x / FSKit backend, Finder or Spotlight
-	 * may call readdir again with a non-zero offset even in old-style mode.
-	 * When that happens, all entries were already returned in the first
-	 * call, so we can safely return 0 (no more entries) instead of crashing.
-	 * See: https://github.com/libfuse/sshfs/issues/338
-	 */
-#ifndef __APPLE__
- assert(offset == 0);
-#endif
-	if (offset != 0)
-		return 0;
 
 	while (!done || outstanding) {
 		struct request *req;
@@ -2383,7 +2388,7 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 				done = 1;
 			}
 			if (!done) {
-				err = buf_get_entries(&name, buf, filler);
+				err = buf_get_entries(&name, entries);
 				buf_free(&name);
 
 				/* increase number of outstanding requests */
@@ -2401,21 +2406,14 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 }
 
 static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
-			     void *buf, off_t offset, fuse_fill_dir_t filler)
+			     GPtrArray *entries)
 {
 	int err;
-	/* See comment in sftp_readdir_async for why offset != 0 is handled
-	 * this way instead of asserting. */
-#ifndef __APPLE__
-	assert(offset == 0);
-#endif	
- if (offset != 0)
-		return 0;
 	do {
 		struct buffer name;
 		err = sftp_request(conn, SSH_FXP_READDIR, handle, SSH_FXP_NAME, &name);
 		if (!err) {
-			err = buf_get_entries(&name, buf, filler);
+			err = buf_get_entries(&name, entries);
 			buf_free(&name);
 		}
 	} while (!err);
@@ -2454,24 +2452,56 @@ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
 	return err;
 }
 
+static void free_dir_entry(gpointer data)
+{
+	struct dir_entry *entry = data;
+	free(entry->name);
+	g_free(entry);
+}
+
 static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 			 off_t offset, struct fuse_file_info *fi,
 			 enum fuse_readdir_flags flags)
 {
-	(void) path; (void) flags;
-	int err;
+	(void) path; (void) flags; (void) offset;
+	unsigned i;
 	struct dir_handle *handle;
 
 	handle = (struct dir_handle*) fi->fh;
 
-	if (sshfs.sync_readdir)
-		err = sftp_readdir_sync(handle->conn, &handle->buf, dbuf,
-					offset, filler);
-	else
-		err = sftp_readdir_async(handle->conn, &handle->buf, dbuf,
-					 offset, filler);
+	/*
+	 * Read the whole directory into a cached snapshot on the first call.
+	 * The SFTP directory handle is single-pass, so this snapshot is what
+	 * lets us serve repeated readdir calls (any offset, including
+	 * offset==0 rewinds from macFUSE) without the directory contents
+	 * vanishing. See: https://github.com/libfuse/sshfs/issues/338
+	 */
+	if (!handle->read_done) {
+		handle->entries = g_ptr_array_new_with_free_func(free_dir_entry);
+		if (sshfs.sync_readdir)
+			handle->read_err = sftp_readdir_sync(handle->conn,
+							     &handle->buf,
+							     handle->entries);
+		else
+			handle->read_err = sftp_readdir_async(handle->conn,
+							      &handle->buf,
+							      handle->entries);
+		handle->read_done = 1;
+	}
 
-	return err;
+	if (handle->read_err)
+		return handle->read_err;
+
+	/*
+	 * Old-style readdir: hand FUSE the complete listing with offset 0 and
+	 * let it do the offset-based slicing itself.
+	 */
+	for (i = 0; i < handle->entries->len; i++) {
+		struct dir_entry *entry = g_ptr_array_index(handle->entries, i);
+		filler(dbuf, entry->name, &entry->stbuf, 0, 0);
+	}
+
+	return 0;
 }
 
 static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
@@ -2486,6 +2516,8 @@ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
 	handle->conn->dir_count--;
 	pthread_mutex_unlock(&sshfs.lock);
 	buf_free(&handle->buf);
+	if (handle->entries)
+		g_ptr_array_free(handle->entries, TRUE);
 	g_free(handle);
 	return err;
 }
