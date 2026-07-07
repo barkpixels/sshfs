@@ -237,16 +237,20 @@ struct dir_handle {
 	struct buffer buf;
 	struct conn *conn;
 	/*
-	 * Cached snapshot of the whole directory listing. sshfs uses
-	 * old-style readdir and the underlying SFTP directory handle is
-	 * single-pass, so we read the entire directory once and serve every
-	 * readdir call (with any offset, including offset==0 rewinds issued
-	 * by macFUSE) from this snapshot. See:
+	 * Snapshot of the *current* enumeration. sshfs uses old-style readdir
+	 * over a single-pass SFTP directory handle. Each new enumeration
+	 * (offset == 0, e.g. a fresh listing or a rewinddir) re-reads the
+	 * directory from the server so newly created files and updated
+	 * attributes show up; a continuation (offset != 0) is served from this
+	 * snapshot so the listing never comes back empty when the handle has
+	 * already been exhausted. See:
 	 * https://github.com/libfuse/sshfs/issues/338
 	 */
 	GPtrArray *entries;	/* array of struct dir_entry * */
-	int read_done;		/* directory has been read from the server */
-	int read_err;		/* error from reading the directory, if any */
+	char *path;		/* directory path, for reopening the handle */
+	int read_err;		/* error from the last read, if any */
+	int has_handle;		/* buf holds an open SFTP dir handle to close */
+	int buf_exhausted;	/* the SFTP handle has been read to EOF */
 };
 
 struct list_head {
@@ -2445,6 +2449,8 @@ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
 		handle->conn = conn;
 		handle->conn->dir_count++;
 		pthread_mutex_unlock(&sshfs.lock);
+		handle->has_handle = 1;
+		handle->path = g_strdup(path);
 		fi->fh = (unsigned long) handle;
 	} else
 		g_free(handle);
@@ -2459,34 +2465,73 @@ static void free_dir_entry(gpointer data)
 	g_free(entry);
 }
 
+/*
+ * Reopen the SFTP directory handle. SFTP has no rewind, so re-reading a
+ * directory from the start means closing the exhausted handle and opening a
+ * fresh one.
+ */
+static int sshfs_reopen_dir(struct dir_handle *handle)
+{
+	struct buffer buf;
+	int err;
+
+	if (handle->has_handle) {
+		sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf, 0, NULL);
+		/* free + reset to a clean state so sftp_request can refill it */
+		buf_clear(&handle->buf);
+		handle->has_handle = 0;
+	}
+	buf_init(&buf, 0);
+	buf_add_path(&buf, handle->path);
+	err = sftp_request(handle->conn, SSH_FXP_OPENDIR, &buf,
+			   SSH_FXP_HANDLE, &handle->buf);
+	buf_free(&buf);
+	if (!err) {
+		buf_finish(&handle->buf);
+		handle->has_handle = 1;
+		handle->buf_exhausted = 0;
+	}
+	return err;
+}
+
 static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 			 off_t offset, struct fuse_file_info *fi,
 			 enum fuse_readdir_flags flags)
 {
-	(void) path; (void) flags; (void) offset;
+	(void) path; (void) flags;
 	unsigned i;
 	struct dir_handle *handle;
 
 	handle = (struct dir_handle*) fi->fh;
 
 	/*
-	 * Read the whole directory into a cached snapshot on the first call.
-	 * The SFTP directory handle is single-pass, so this snapshot is what
-	 * lets us serve repeated readdir calls (any offset, including
-	 * offset==0 rewinds from macFUSE) without the directory contents
-	 * vanishing. See: https://github.com/libfuse/sshfs/issues/338
+	 * offset == 0 starts a fresh enumeration (a new listing or a
+	 * rewinddir), so re-read the directory from the server to pick up newly
+	 * created files and updated attributes. The SFTP handle is single-pass:
+	 * once read to EOF, reusing it would read nothing and the directory
+	 * would appear empty, so we reopen a fresh handle first. offset != 0 is
+	 * a continuation of the current enumeration and is served from the
+	 * snapshot taken at offset 0.
+	 * See: https://github.com/libfuse/sshfs/issues/338
 	 */
-	if (!handle->read_done) {
-		handle->entries = g_ptr_array_new_with_free_func(free_dir_entry);
-		if (sshfs.sync_readdir)
-			handle->read_err = sftp_readdir_sync(handle->conn,
-							     &handle->buf,
-							     handle->entries);
-		else
-			handle->read_err = sftp_readdir_async(handle->conn,
-							      &handle->buf,
-							      handle->entries);
-		handle->read_done = 1;
+	if (offset == 0 || handle->entries == NULL) {
+		if (handle->buf_exhausted)
+			handle->read_err = sshfs_reopen_dir(handle);
+		if (!handle->read_err) {
+			if (handle->entries)
+				g_ptr_array_free(handle->entries, TRUE);
+			handle->entries =
+				g_ptr_array_new_with_free_func(free_dir_entry);
+			if (sshfs.sync_readdir)
+				handle->read_err = sftp_readdir_sync(
+					handle->conn, &handle->buf,
+					handle->entries);
+			else
+				handle->read_err = sftp_readdir_async(
+					handle->conn, &handle->buf,
+					handle->entries);
+			handle->buf_exhausted = 1;
+		}
 	}
 
 	if (handle->read_err)
@@ -2511,13 +2556,18 @@ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
 	struct dir_handle *handle;
 
 	handle = (struct dir_handle*) fi->fh;
-	err = sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf, 0, NULL);
+	err = 0;
+	if (handle->has_handle) {
+		err = sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf,
+				   0, NULL);
+		buf_free(&handle->buf);
+	}
 	pthread_mutex_lock(&sshfs.lock);
 	handle->conn->dir_count--;
 	pthread_mutex_unlock(&sshfs.lock);
-	buf_free(&handle->buf);
 	if (handle->entries)
 		g_ptr_array_free(handle->entries, TRUE);
+	g_free(handle->path);
 	g_free(handle);
 	return err;
 }
